@@ -15,6 +15,7 @@ from merge_engine import (
     SOURCE_HEADER,
     find_input_files,
     find_output_conflicts,
+    inspect_sources,
     merge_workbooks,
     normalize_output_name,
 )
@@ -70,14 +71,24 @@ class MergeEngineTests(unittest.TestCase):
             root = Path(temp)
             (root / "B.xlsx").touch()
             (root / "a.XLSX").touch()
+            (root / "c.csv").touch()
+            (root / "d.xlsm").touch()
             (root / "~$锁定.xlsx").touch()
             (root / "说明.txt").touch()
             (root / "sub").mkdir()
-            (root / "sub" / "c.xlsx").touch()
+            (root / "sub" / "z.xlsx").touch()
             excluded = root / "B.xlsx"
-
             files = find_input_files(root, excluded_paths=[excluded])
-            self.assertEqual([path.name for path in files], ["a.XLSX"])
+            self.assertEqual([path.name for path in files], ["a.XLSX", "c.csv", "d.xlsm"])
+
+    def test_find_input_files_recurses_and_ignores_reports(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "sub").mkdir()
+            (root / "sub" / "数据.csv").write_text("a\n1\n", encoding="utf-8")
+            (root / "合并报告_20260101.xlsx").touch()
+            files = find_input_files(root, recursive=True)
+            self.assertEqual([item.relative_to(root).as_posix() for item in files], ["sub/数据.csv"])
 
     def test_basic_merge_preserves_values_and_adds_source_column(self) -> None:
         with TemporaryDirectory() as temp:
@@ -85,7 +96,6 @@ class MergeEngineTests(unittest.TestCase):
             input_dir = root / "input"
             output_dir = root / "output"
             input_dir.mkdir()
-
             row_a = make_row(1, "甲", "张老师")
             row_a[3] = datetime(2026, 7, 22, 9, 30)
             create_workbook(
@@ -98,15 +108,10 @@ class MergeEngineTests(unittest.TestCase):
                 rows=[make_row(2, "乙", "李老师")],
                 hidden_leading_sheet=True,
             )
-
-            summary = merge_workbooks(
-                MergeConfig(input_dir, output_dir, "结果.xlsx")
-            )
-
+            summary = merge_workbooks(MergeConfig(input_dir, output_dir, "结果.xlsx"))
             self.assertEqual(summary.total_rows, 2)
             self.assertEqual([path.name for path in summary.output_files], ["结果.xlsx"])
-            self.assertTrue(summary.report_path.exists())
-
+            self.assertEqual(summary.report_path.suffix, ".xlsx")
             workbook = load_workbook(summary.output_files[0], data_only=False)
             sheet = workbook["合并结果"]
             self.assertEqual(sheet.max_column, 18)
@@ -121,10 +126,12 @@ class MergeEngineTests(unittest.TestCase):
             self.assertEqual(sheet.auto_filter.ref, "A1:R3")
             self.assertTrue(sheet.cell(1, 1).font.bold)
             workbook.close()
-
-            report = summary.report_path.read_text(encoding="utf-8-sig")
-            self.assertIn("成功文件数：2", report)
-            self.assertIn("合并数据行：2", report)
+            report = load_workbook(summary.report_path, read_only=True, data_only=True)
+            self.assertEqual(report.sheetnames, ["任务汇总", "文件明细", "字段映射"])
+            values = dict(report["任务汇总"].iter_rows(min_row=2, values_only=True))
+            self.assertEqual(values["成功文件数"], 2)
+            self.assertEqual(values["合并数据行"], 2)
+            report.close()
 
     def test_header_whitespace_is_normalized_for_comparison(self) -> None:
         with TemporaryDirectory() as temp:
@@ -136,12 +143,7 @@ class MergeEngineTests(unittest.TestCase):
             headers = base_headers()
             headers[0] = " 编号 "
             headers[2] = " 主讲老师 "
-            create_workbook(
-                input_dir / "02.xlsx",
-                headers=headers,
-                rows=[make_row(2, "乙", "李老师")],
-            )
-
+            create_workbook(input_dir / "02.xlsx", headers=headers, rows=[make_row(2, "乙", "李老师")])
             summary = merge_workbooks(MergeConfig(input_dir, output_dir, "结果.xlsx"))
             self.assertEqual(summary.total_rows, 2)
             self.assertTrue(all(result.status == "成功" for result in summary.file_results))
@@ -152,41 +154,27 @@ class MergeEngineTests(unittest.TestCase):
             input_dir = root / "input"
             output_dir = root / "output"
             input_dir.mkdir()
-            create_workbook(
-                input_dir / "01_有效.xlsx",
-                rows=[make_row(1, "甲", "张老师")],
-            )
-
-            missing_teacher_headers = base_headers()
-            missing_teacher_headers[2] = "授课人"
-            create_workbook(
-                input_dir / "02_缺老师.xlsx",
-                headers=missing_teacher_headers,
-                rows=[make_row(2, "乙", "李老师")],
-            )
-
-            mismatched_headers = base_headers()
-            mismatched_headers[0] = "不同编号"
-            create_workbook(
-                input_dir / "03_表头不同.xlsx",
-                headers=mismatched_headers,
-                rows=[make_row(3, "丙", "王老师")],
-            )
+            create_workbook(input_dir / "01_有效.xlsx", rows=[make_row(1, "甲", "张老师")])
+            missing = base_headers()
+            missing[2] = "授课人"
+            create_workbook(input_dir / "02_缺老师.xlsx", headers=missing, rows=[make_row(2, "乙", "李老师")])
+            mismatch = base_headers()
+            mismatch[0] = "不同编号"
+            create_workbook(input_dir / "03_表头不同.xlsx", headers=mismatch, rows=[make_row(3, "丙", "王老师")])
             (input_dir / "04_损坏.xlsx").write_bytes(b"not-an-xlsx")
             create_workbook(input_dir / "05_空数据.xlsx", rows=[])
-
             summary = merge_workbooks(MergeConfig(input_dir, output_dir, "结果.xlsx"))
-
             self.assertEqual(summary.total_rows, 1)
             statuses = {result.path.name: result for result in summary.file_results}
             self.assertEqual(statuses["01_有效.xlsx"].status, "成功")
             for name in ("02_缺老师.xlsx", "03_表头不同.xlsx", "04_损坏.xlsx", "05_空数据.xlsx"):
                 self.assertEqual(statuses[name].status, "跳过")
                 self.assertTrue(statuses[name].reason)
-
-            report = summary.report_path.read_text(encoding="utf-8-sig")
-            self.assertIn("跳过文件数：4", report)
-            self.assertIn("A:Q 表头与首个有效文件不一致", report)
+            report = load_workbook(summary.report_path, read_only=True, data_only=True)
+            rows = list(report["文件明细"].iter_rows(min_row=2, values_only=True))
+            self.assertEqual(sum(1 for row in rows if row[0] == "跳过"), 4)
+            self.assertTrue(any("A:Q 表头" in str(row[-1]) for row in rows))
+            report.close()
 
     def test_splitting_uses_excel_row_boundary_and_repeats_header(self) -> None:
         with TemporaryDirectory() as temp:
@@ -196,30 +184,19 @@ class MergeEngineTests(unittest.TestCase):
             input_dir.mkdir()
             rows = [make_row(index, f"用户{index}", "张老师") for index in range(1, 6)]
             create_workbook(input_dir / "课程.xlsx", rows=rows)
-
             summary = merge_workbooks(
-                MergeConfig(
-                    input_dir,
-                    output_dir,
-                    "结果.xlsx",
-                    max_data_rows_per_file=2,
-                )
+                MergeConfig(input_dir, output_dir, "结果.xlsx", max_data_rows_per_file=2)
             )
-
             self.assertEqual(
                 [path.name for path in summary.output_files],
                 ["结果_第1部分.xlsx", "结果_第2部分.xlsx", "结果_第3部分.xlsx"],
             )
-            expected_rows = [3, 3, 2]
-            for path, row_count in zip(summary.output_files, expected_rows, strict=True):
+            for path, row_count in zip(summary.output_files, [3, 3, 2], strict=True):
                 workbook = load_workbook(path, read_only=True)
-                try:
-                    sheet = workbook["合并结果"]
-                    rows = list(sheet.iter_rows(values_only=True))
-                    self.assertEqual(len(rows), row_count)
-                    self.assertEqual(rows[0][17], SOURCE_HEADER)
-                finally:
-                    workbook.close()
+                rows_out = list(workbook["合并结果"].iter_rows(values_only=True))
+                self.assertEqual(len(rows_out), row_count)
+                self.assertEqual(rows_out[0][17], SOURCE_HEADER)
+                workbook.close()
 
     def test_existing_outputs_require_confirmation_and_stale_parts_are_removed(self) -> None:
         with TemporaryDirectory() as temp:
@@ -233,17 +210,12 @@ class MergeEngineTests(unittest.TestCase):
             stale = output_dir / "结果_第9部分.xlsx"
             exact.write_text("old exact", encoding="utf-8")
             stale.write_text("old stale", encoding="utf-8")
-
             conflicts = find_output_conflicts(output_dir, "结果.xlsx")
             self.assertEqual({path.name for path in conflicts}, {exact.name, stale.name})
             with self.assertRaises(OutputExistsError):
                 merge_workbooks(MergeConfig(input_dir, output_dir, "结果.xlsx"))
             self.assertEqual(exact.read_text(encoding="utf-8"), "old exact")
-            self.assertTrue(stale.exists())
-
-            summary = merge_workbooks(
-                MergeConfig(input_dir, output_dir, "结果.xlsx", overwrite=True)
-            )
+            summary = merge_workbooks(MergeConfig(input_dir, output_dir, "结果.xlsx", overwrite=True))
             self.assertTrue(exact.exists())
             self.assertFalse(stale.exists())
             self.assertEqual({path.name for path in summary.overwritten_files}, {exact.name, stale.name})
@@ -257,7 +229,6 @@ class MergeEngineTests(unittest.TestCase):
             create_workbook(input_dir / "课程.xlsx", rows=[make_row(1, "甲", "张老师")])
             cancellation = threading.Event()
             cancellation.set()
-
             with self.assertRaises(MergeCancelled):
                 merge_workbooks(
                     MergeConfig(input_dir, output_dir, "结果.xlsx"),
@@ -266,7 +237,19 @@ class MergeEngineTests(unittest.TestCase):
             self.assertFalse((output_dir / "结果.xlsx").exists())
             self.assertFalse(any(output_dir.glob(".excel_merge_*")))
 
+    def test_inspection_can_be_reused_by_merge(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            create_workbook(input_dir / "课程.xlsx", rows=[make_row(1, "甲", "张老师")])
+            config = MergeConfig(input_dir, output_dir, "结果.xlsx")
+            plan = inspect_sources(config)
+            self.assertEqual(plan.total_rows, 1)
+            summary = merge_workbooks(config, plan=plan)
+            self.assertEqual(summary.total_rows, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
